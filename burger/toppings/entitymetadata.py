@@ -1,7 +1,7 @@
 import six
 
 from .topping import Topping
-from burger.util import WalkerCallback, walk_method
+from burger.util import WalkerCallback, walk_method, string_from_invokedymanic
 
 from jawa.constants import *
 from jawa.util.descriptor import method_descriptor
@@ -49,6 +49,10 @@ class EntityMetadataTopping(Topping):
                 const = ins.operands[0]
                 if const == "Unregistered serializer ":
                     break
+            elif dataserializers_class and ins == "invokedynamic":
+                text = string_from_invokedymanic(ins, datamanager_cf)
+                if "Unregistered serializer " in text:
+                    break
         else:
             raise Exception("Failed to identify dataserializers")
 
@@ -71,6 +75,11 @@ class EntityMetadataTopping(Topping):
         entity_classes = {e["class"]: e["name"] for e in six.itervalues(entities)}
         parent_by_class = {}
         metadata_by_class = {}
+        bitfields_by_class = {}
+
+        # this flag is shared among all entities
+        # getSharedFlag is currently the only method in Entity with those specific args and returns, this may change in the future! (hopefully not)
+        shared_get_flag_method = base_entity_cf.methods.find_one(args="I", returns="Z").name.value
 
         def fill_class(cls):
             # Returns the starting index for metadata in subclasses of cls
@@ -231,8 +240,76 @@ class EntityMetadataTopping(Topping):
             elif cls == base_entity_class:
                 walk_method(cf, cf.methods.find_one(name="<init>"), MetadataDefaultsContext(True), verbose)
 
-            metadata_by_class[cls] = metadata
+            get_flag_method = None
 
+            # find if the class has a `boolean getFlag(int)` method
+            for method in cf.methods.find(args="I", returns="Z"):
+                previous_operators = []
+                for ins in method.code.disassemble():
+                    if ins.mnemonic == "bipush":
+                        # check for a series of operators that looks something like this
+                        # `return ((Byte)this.R.a(bo) & var1) != 0;`
+                        operator_matcher = ["aload", "getfield", "getstatic", "invokevirtual", "checkcast", "invokevirtual", "iload", "iand", "ifeq", "bipush", "goto"]
+                        previous_operators_match = previous_operators == operator_matcher
+
+                        if previous_operators_match and ins.operands[0].value == 0:
+                            # store the method name as the result for later
+                            get_flag_method = method.name.value
+
+                    previous_operators.append(ins.mnemonic)
+
+            bitfields = []
+
+            # find the methods that get bit fields
+            for method in cf.methods.find(args="", returns="Z"):
+                if method.code:
+                    bitmask_value = None
+                    stack = []
+                    for ins in method.code.disassemble():
+                        # the method calls getField() or getSharedField()
+                        if ins.mnemonic in ("invokevirtual", "invokespecial", "invokeinterface", "invokestatic"):
+                            calling_method = ins.operands[0].name_and_type.name.value
+
+                            has_correct_arguments = ins.operands[0].name_and_type.descriptor.value == "(I)Z"
+
+                            is_getflag_method = has_correct_arguments and calling_method == get_flag_method
+                            is_shared_getflag_method = has_correct_arguments and calling_method == shared_get_flag_method
+
+                            # if it's a shared flag, update the bitfields_by_class for abstract_entity
+                            if is_shared_getflag_method and stack:
+                                bitmask_value = stack.pop()
+                                if bitmask_value is not None:
+                                    base_entity_cls = base_entity_cf.this.name.value
+                                    if base_entity_cls not in bitfields_by_class:
+                                        bitfields_by_class[base_entity_cls] = []
+                                    bitfields_by_class[base_entity_cls].append({
+                                        # we include the class here so it can be easily figured out from the mappings
+                                        "class": cls,
+                                        "method": method.name.value,
+                                        "mask": 1 << bitmask_value
+                                    })
+                                bitmask_value = None
+                            elif is_getflag_method and stack:
+                                bitmask_value = stack.pop()
+                                break
+                        elif ins.mnemonic == "iand":
+                            # get the last item in the stack, since it's the bitmask
+                            bitmask_value = stack[-1]
+                            break
+                        elif ins.mnemonic == "bipush":
+                            stack.append(ins.operands[0].value)
+                    if bitmask_value:
+                        bitfields.append({
+                            "method": method.name.value,
+                            "mask": bitmask_value
+                        })
+
+
+            metadata_by_class[cls] = metadata
+            if cls not in bitfields_by_class:
+                bitfields_by_class[cls] = bitfields
+            else:
+                bitfields_by_class[cls].extend(bitfields)
             return index
 
         for cls in six.iterkeys(entity_classes):
@@ -245,7 +322,8 @@ class EntityMetadataTopping(Topping):
             if metadata_by_class[cls]:
                 metadata.append({
                     "class": cls,
-                    "data": metadata_by_class[cls]
+                    "data": metadata_by_class[cls],
+                    "bitfields": bitfields_by_class[cls]
                 })
 
             cls = parent_by_class[cls]
@@ -254,7 +332,8 @@ class EntityMetadataTopping(Topping):
                 if metadata_by_class[cls]:
                     metadata.insert(0, {
                         "class": cls,
-                        "data": metadata_by_class[cls]
+                        "data": metadata_by_class[cls],
+                        "bitfields": bitfields_by_class[cls]
                     })
                 cls = parent_by_class[cls]
 
@@ -314,6 +393,7 @@ class EntityMetadataTopping(Topping):
     def identify_serializer(classloader, cls, classes, verbose):
         # In here because otherwise the import messes with finding the topping in this file
         from .packetinstructions import PacketInstructionsTopping as _PIT
+        from .packetinstructions import PACKETBUF_NAME
 
         cf = classloader[cls]
         sig = cf.attributes.find_one(name="Signature").signature.value
@@ -384,9 +464,10 @@ class EntityMetadataTopping(Topping):
         # Note that we are using the bridge method that takes an object, and not the more find
         try:
             write_args = "L" + classes["packet.packetbuffer"] + ";Ljava/lang/Object;"
-            operations = _PIT.operations(classloader, cls + ".class",  # XXX This .class only exists because PIT needs it, for no real reason
-                    classes, verbose,
-                    args=write_args, arg_names=("this", "packetbuffer", "value"))
+            methods = list(cf.methods.find(returns="V", args=write_args))
+            assert len(methods) == 1
+            operations = _PIT.operations(classloader, cf, classes, verbose,
+                    methods[0], arg_names=("this", PACKETBUF_NAME, "value"))
             serializer.update(_PIT.format(operations))
         except:
             if verbose:

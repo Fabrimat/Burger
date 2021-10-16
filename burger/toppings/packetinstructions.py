@@ -35,7 +35,10 @@ from jawa.constants import *
 from jawa.transforms import simple_swap
 
 from .topping import Topping
-from burger.util import stringify_invokedynamic
+from burger.util import InvokeDynamicInfo, REF_invokeStatic
+
+SUB_INS_EPSILON = .01
+PACKETBUF_NAME = "packetbuffer" # Used to specially identify the PacketBuffer we care about
 
 class PacketInstructionsTopping(Topping):
     """Provides the instructions used to construct network packets."""
@@ -118,7 +121,8 @@ class PacketInstructionsTopping(Topping):
         for key, packet in six.iteritems(aggregate["packets"]["packet"]):
             operations = None
             try:
-                operations = _PIT.operations(classloader, packet["class"], aggregate["classes"], verbose)
+                classname = packet["class"][:-len(".class")]
+                operations = _PIT.class_operations(classloader, classname, aggregate["classes"], verbose)
                 packet.update(_PIT.format(operations))
             except Exception as e:
                 if verbose:
@@ -130,33 +134,44 @@ class PacketInstructionsTopping(Topping):
                     print()
 
     @staticmethod
-    def operations(classloader, classname, classes, verbose, args=None,
-                   methodname=None, arg_names=("this", "packetbuffer")):
-        """Gets the instructions of the specified method"""
-
+    def class_operations(classloader, classname, classes, verbose):
+        """Decompiles the instructions for a specific packet."""
         # Find the writing method
-        cf = classloader[classname[:-len(".class")]] # XXX triming a .class that has no reason to exist anyways
+        cf = classloader[classname]
 
-        if methodname is None and args is None:
-            methods = list(cf.methods.find(returns="V", args="L" + classes["packet.packetbuffer"] + ";"))
+        methods = list(cf.methods.find(returns="V", args="L" + classes["packet.packetbuffer"] + ";"))
 
-            if len(methods) == 2:
-                method = methods[1]
-            else:
-                if cf.super_.name.value != "java/lang/Object":
-                    return _PIT.operations(classloader, cf.super_.name.value + ".class", classes, verbose)
-                else:
-                    raise Exception("Failed to find method in class or superclass")
-        elif methodname is None:
-            method = cf.methods.find_one(args=args)
+        if len(methods) == 2:
+            # Assume the second method is the one that writes
+            method = methods[1]
+        elif len(methods) == 1:
+            # 21w08a+: A constructor or static method now handles reading.
+            # The constructor still returns void, so the above case is still
+            # usually hit, but the static method returns the packet.  When
+            # the static method exists, there only is one matching method,
+            # so just assume that that method handles writing.
+            method = methods[0]
         else:
-            method = cf.methods.find_one(name=methodname, args=args)
+            assert len(methods) == 0 # There shouldn't be more than 2 packetbuffer-related methods
+            if cf.super_.name.value != "java/lang/Object":
+                # Try the superclass
+                return _PIT.class_operations(classloader, cf.super_.name.value, classes, verbose)
+            else:
+                raise Exception("Failed to find method in class or superclass")
 
-        if method.access_flags.acc_abstract:
-            # Abstract method call -- just log that, since we can't view it
-            return [Operation(instruction.pos, "interfacecall",
-                              type="abstract", target=operands[0].c, name=name,
-                              method=name + desc, field=obj, args=_PIT.join(arguments))]
+        assert not method.access_flags.acc_static
+        assert not method.access_flags.acc_abstract
+
+        return _PIT.operations(classloader, cf, classes, verbose, method, ("this", PACKETBUF_NAME))
+
+    @staticmethod
+    def operations(classloader, cf, classes, verbose, method, arg_names):
+        """Decompiles the specified method."""
+        if method.access_flags.acc_static:
+            assert len(arg_names) == len(method.args)
+        else:
+            # `this` is a local variable and thus needs to be counted.
+            assert len(arg_names) == len(method.args) + 1
 
         # Decode the instructions
         operations = []
@@ -201,198 +216,13 @@ class PacketInstructionsTopping(Topping):
 
             # Method calls
             if mnemonic in ("invokevirtual", "invokespecial", "invokestatic", "invokeinterface"):
-                name = operands[0].name
-                desc = operands[0].descriptor
-
-                descriptor = method_descriptor(desc)
-                num_arguments = len(descriptor.args)
-
-                if num_arguments > 0:
-                    arguments = stack[-len(descriptor.args):]
-                else:
-                    arguments = []
-                for i in six.moves.range(num_arguments):
-                    stack.pop()
-
-                is_static = (mnemonic == "invokestatic")
-                obj = operands[0].classname if is_static else stack.pop()
-
-                if name in _PIT.TYPES:
-                    # Builtin netty buffer methods
-                    assert num_arguments == 1
-                    operations.append(Operation(instruction.pos, "write",
-                                                type=_PIT.TYPES[name],
-                                                field=arguments[0]))
-                    stack.append(obj)
-                elif len(name) == 1 and isinstance(obj, StackOperand) and obj.value == "packetbuffer":
-                    # Checking len(name) == 1 is used to see if it's a Minecraft
-                    # method (due to obfuscation).  Netty methods have real
-                    # (and thus longer) names.
-                    assert num_arguments >= 1
-                    arg_type = descriptor.args[0].name
-                    field = arguments[0]
-
-                    if descriptor.args[0].dimensions == 1 and num_arguments == 1:
-                        # Array methods, which prefix a length
-                        operations.append(Operation(instruction.pos, "write",
-                                                    type="varint",
-                                                    field="%s.length" % field))
-                        if arg_type == "byte":
-                            operations.append(Operation(instruction.pos, "write",
-                                                        type="byte[]",
-                                                        field=field))
-                        elif arg_type == "int":
-                            operations.append(Operation(instruction.pos, "write",
-                                                        type="varint[]",
-                                                        field=field))
-                        elif arg_type == "long":
-                            operations.append(Operation(instruction.pos, "write",
-                                                        type="long[]",
-                                                        field=field))
-                        else:
-                            raise Exception("Unexpected array type: " + arg_type)
-                    elif num_arguments == 1:
-                        assert descriptor.args[0].dimensions == 0
-                        if arg_type == "java/lang/String":
-                            max_length = 32767 # not using this at the time
-                            operations.append(Operation(instruction.pos, "write",
-                                                        type="string",
-                                                        field=field))
-                        elif arg_type == "java/util/UUID":
-                            operations.append(Operation(instruction.pos, "write",
-                                                        type="uuid",
-                                                        field=field))
-                        elif arg_type == "java/util/Date":
-                            operations.append(Operation(instruction.pos, "write",
-                                                        type="long",
-                                                        field="%s.getTime()" % field))
-                        elif arg_type == "int":
-                            operations.append(Operation(instruction.pos, "write",
-                                                        type="varint",
-                                                        field=field))
-                        elif arg_type == "long":
-                            operations.append(Operation(instruction.pos, "write",
-                                                        type="varlong",
-                                                        field=field))
-                        elif arg_type == "java/lang/Enum":
-                            # If we were using the read method instead of the write method, then we could get the class for this enum...
-                            operations.append(Operation(instruction.pos, "write",
-                                                        type="enum",
-                                                        field=field))
-                        elif arg_type == classes["nbtcompound"]:
-                            operations.append(Operation(instruction.pos, "write",
-                                                        type="nbtcompound",
-                                                        field=field))
-                        elif arg_type == classes["itemstack"]:
-                            operations.append(Operation(instruction.pos, "write",
-                                                        type="itemstack",
-                                                        field=field))
-                        elif arg_type == classes["chatcomponent"]:
-                            operations.append(Operation(instruction.pos, "write",
-                                                        type="chatcomponent",
-                                                        field=field))
-                        elif arg_type == classes["identifier"]:
-                            operations.append(Operation(instruction.pos, "write",
-                                                        type="identifier",
-                                                        field=field))
-                        elif "position" not in classes or arg_type == classes["position"]:
-                            if "position" not in classes:
-                                classes["position"] = arg_type
-                                if verbose:
-                                    print("Assuming", arg_type, "is the position class")
-                            operations.append(Operation(instruction.pos,
-                                                        "write", type="position",
-                                                        field=field))
-                        else:
-                            # Unknown type in packetbuffer; try inlining it as well
-                            # (on the assumption that it's something made of a few calls,
-                            # and not e.g. writeVarInt)
-                            if verbose:
-                                print("Inlining code for", arg_type)
-                            operations += _PIT.sub_operations(
-                                classloader, cf, classes, instruction, verbose, operands[0],
-                                [obj] + arguments if not is_static else arguments
-                            )
-                    elif num_arguments == 2:
-                        if arg_type == "java/lang/String" and descriptor.args[1].name == "int":
-                            max_length = arguments[1] # not using this at this time
-                            operations.append(Operation(instruction.pos, "write",
-                                                        type="string",
-                                                        field=field))
-                        elif arg_type == "com/mojang/serialization/Codec":
-                            codec = arguments[0]
-                            value = arguments[1]
-                            # This isn't the exact syntax used by DataFixerUpper,
-                            # but it's close enough for our purposes
-                            field = "%s.encode(%s)" % (codec, value)
-                            operations.append(Operation(instruction.pos, "write",
-                                                        type="nbtcompound",
-                                                        field=field))
-                        else:
-                            raise Exception("Unexpected descriptor " + desc)
-                    else:
-                        raise Exception("Unexpected num_arguments: " + str(num_arguments) + " - desc " + desc)
-                    # Return the buffer back to the stack, if needed
-                    if descriptor.returns.name == classes["packet.packetbuffer"]:
-                        stack.append(obj)
-                elif name == "<init>":
-                    # Constructor call.  Should have the instance right
-                    # on the stack as well (due to constructors returning void).
-                    # Add the arguments to that object.
-                    assert stack[-1] is obj
-                    obj.value += "(" + _PIT.join(arguments) + ")";
-                else:
-
-                    if descriptor.returns.name != "void":
-                        stack.append(StackOperand(
-                            "%s.%s(%s)" % (
-                                obj, name, _PIT.join(arguments)
-                            ),
-                            2 if descriptor.returns.name in ("long", "double") else 1)
-                        )
-
-                    else:
-                        for arg in descriptor.args:
-                            if arg.name == classes["packet.packetbuffer"]:
-                                if operands[0].c == classes["metadata"]:
-                                    # Special case - metadata is a complex type but
-                                    # well documented; we don't want to include its
-                                    # exact writing but just want to instead say
-                                    # 'metadata'.
-
-                                    # There are two cases - one is calling an
-                                    # instance method of metadata that writes
-                                    # out the instance, and the other is a
-                                    # static method that takes a list and then
-                                    # writes that list.
-                                    operations.append(Operation(instruction.pos,
-                                                    "write", type="metadata",
-                                                    field=obj if not is_static else arguments[0]))
-                                    break
-                                if mnemonic != "invokeinterface":
-                                    # If calling a sub method that takes a packetbuffer
-                                    # as a parameter, it's possible that it's a sub
-                                    # method that writes to the buffer, so we need to
-                                    # check it.
-                                    operations += _PIT.sub_operations(
-                                        classloader, cf, classes, instruction, verbose, operands[0],
-                                        [obj] + arguments if not is_static else arguments
-                                    )
-                                else:
-                                    # However, for interface method calls, we can't
-                                    # check its code -- so just note that it's a call
-                                    operations.append(Operation(instruction.pos,
-                                                        "interfacecall",
-                                                        type="interface",
-                                                        target=operands[0].c,
-                                                        name=name,
-                                                        method=name + desc,
-                                                        field=obj,
-                                                        args=_PIT.join(arguments)))
-                                break
+                operations.extend(_PIT._handle_invoke(
+                    classloader, classes, instruction, verbose, operands[0].c,
+                    operands[0].name, method_descriptor(operands[0].descriptor), stack
+                ))
 
             elif mnemonic == "invokedynamic":
-                stack.append(stringify_invokedynamic(stack.pop(), instruction, cf))
+                InvokeDynamicInfo.create(instruction, cf).apply_to_stack(stack)
 
             # Conditional statements and loops
             elif mnemonic.startswith("if"):
@@ -568,10 +398,10 @@ class PacketInstructionsTopping(Topping):
                 index = stack.pop()
                 array = stack.pop()
                 operations.append(Operation(instruction.pos, "arraystore",
-                                        type=type,
-                                        index=index,
-                                        var=array,
-                                        value=value))
+                                            type=type,
+                                            index=index,
+                                            var=array,
+                                            value=value))
 
             # Default handlers
             else:
@@ -608,12 +438,333 @@ class PacketInstructionsTopping(Topping):
         return operations
 
     @staticmethod
-    def join(arguments, seperator=", "):
-        """Converts a list of object into a comma seperated list"""
-        buffer = ""
-        for arg in arguments:
-            buffer += "%s%s" % (arg, seperator)
-        return buffer[:-len(seperator)]
+    def _handle_invoke(classloader, classes, instruction, verbose,
+                      cls, name, desc, stack):
+        """
+        Handles invocation of a method, returning the operations for it and also
+        updating the stack.
+        """
+
+        num_arguments = len(desc.args)
+        assert len(stack) >= num_arguments
+        if num_arguments > 0:
+            arguments = stack[-num_arguments:]
+        else:
+            arguments = []
+        for i in six.moves.range(num_arguments):
+            stack.pop()
+
+        is_static = (instruction.mnemonic == "invokestatic")
+        obj = cls if is_static else stack.pop()
+
+        if name in _PIT.TYPES:
+            # Builtin netty buffer methods
+            assert num_arguments == 1
+            assert not is_static
+            # These methods always return the same buffer.
+            stack.append(obj)
+            return [Operation(instruction.pos, "write", type=_PIT.TYPES[name],
+                              field=arguments[0])]
+        elif len(name) == 1 and isinstance(obj, StackOperand) and obj.value == PACKETBUF_NAME:
+            # Checking len(name) == 1 is used to see if it's a Minecraft method
+            # (due to obfuscation).  Netty methods have real (and thus longer) names.
+            if num_arguments == 1:
+                result = _PIT._handle_1_arg_buffer_call(classloader, classes,
+                                                        instruction, verbose,
+                                                        cls, name, desc, obj,
+                                                        arguments[0])
+            elif num_arguments == 2:
+                result = _PIT._handle_2_arg_buffer_call(classloader, classes,
+                                                        instruction, verbose,
+                                                        cls, name, desc, obj,
+                                                        arguments)
+            elif num_arguments == 3:
+                result = _PIT._handle_3_arg_buffer_call(classloader, classes,
+                                                        instruction, verbose,
+                                                        cls, name, desc, obj,
+                                                        arguments)
+            else:
+                raise Exception("Unexpected num_arguments: " + str(num_arguments) + " - desc " + desc)
+
+            if desc.returns.name == classes["packet.packetbuffer"]:
+                # Return the packetbuffer back to the stack.
+                stack.append(obj)
+            elif desc.returns.name != "void":
+                if verbose:
+                    print("PacketBuffer method that returns something other than PacketBuffer used!")
+                stack.append(object())
+
+            return result
+        elif name == "<init>":
+            # Constructor call.  Should have the instance right on the stack
+            # as well (due to constructors returning void).
+            # Add the arguments to that object.
+            assert stack[-1] is obj
+            assert isinstance(obj, StackOperand)
+            obj.value += "(" + _PIT.join(arguments) + ")";
+            return []
+        elif name == "forEach":
+            assert num_arguments == 1
+            assert not is_static
+            return _PIT._handle_foreach(classloader, classes, instruction, verbose,
+                                        cls, name, desc, obj, arguments[0])
+        else:
+            if desc.returns.name != "void":
+                # Assume that any function that returns something does not write
+                # to the buffer.
+                stack.append(StackOperand(
+                    "%s.%s(%s)" % (
+                        obj, name, _PIT.join(arguments)
+                    ),
+                    2 if desc.returns.name in ("long", "double") else 1)
+                )
+                return []
+            else:
+                for arg in desc.args:
+                    if arg.name == classes["packet.packetbuffer"]:
+                        if cls == classes["metadata"]:
+                            # Special case - metadata is a complex type but
+                            # well documented; we don't want to include its
+                            # exact writing but just want to instead say
+                            # 'metadata'.
+
+                            # There are two cases - one is calling an
+                            # instance method of metadata that writes
+                            # out the instance, and the other is a
+                            # static method that takes a list and then
+                            # writes that list.
+                            return [Operation(instruction.pos, "write", type="metadata",
+                                              field=obj if not is_static else arguments[0])]
+
+                        # If calling a sub-method that takes a packetbuffer as a
+                        # parameter, it's possible that it's a sub-method that
+                        # writes to the buffer, so we need to check it.
+                        # Note that we do this even if the method is abstract
+                        # or part of an interface; _sub_operations checks that.
+                        return _PIT._sub_operations(
+                            classloader, classes, instruction, verbose,
+                            cls, name, desc,
+                            [obj] + arguments if not is_static else arguments
+                        )
+                else:
+                    # Call to a method that does not take a packetbuffer.
+                    # It might have side-effects, but we don't know what they
+                    # would be and can't do anything with them.
+                    if verbose:
+                        print("Call to %s.%s%s does not use buffer; ignoring" % (cls, name, desc.descriptor))
+                    return []
+
+    @staticmethod
+    def _handle_1_arg_buffer_call(classloader, classes, instruction, verbose,
+                                  cls, name, desc, instance, arg):
+        arg_type = desc.args[0].name
+
+        if desc.args[0].dimensions == 1:
+            # Array methods, which prefix a length
+            operations = [Operation(instruction.pos, "write",
+                                    type="varint", field="%s.length" % arg)]
+            if arg_type == "byte":
+                operations.append(Operation(instruction.pos, "write",
+                                            type="byte[]", field=arg))
+            elif arg_type == "int":
+                operations.append(Operation(instruction.pos, "write",
+                                            type="varint[]", field=arg))
+            elif arg_type == "long":
+                operations.append(Operation(instruction.pos, "write",
+                                            type="long[]", field=arg))
+            else:
+                raise Exception("Unexpected array type: " + arg_type)
+            return operations
+
+        assert desc.args[0].dimensions == 0
+        if arg_type == "java/lang/String":
+            max_length = 32767 # not using this at the time
+            return [Operation(instruction.pos, "write", type="string", field=arg)]
+        elif arg_type == "java/util/UUID":
+            return [Operation(instruction.pos, "write", type="uuid", field=arg)]
+        elif arg_type == "java/util/Date":
+            return [Operation(instruction.pos, "write", type="long", field="%s.getTime()" % arg)]
+        elif arg_type == "int":
+            # We know that the obfuscated function that takes an int or long is
+            # the VarInt/VarLong version, and the non-obfuscated one with a netty
+            # name is the regular version.
+            return [Operation(instruction.pos, "write", type="varint", field=arg)]
+        elif arg_type == "long":
+            return [Operation(instruction.pos, "write", type="varlong", field=arg)]
+        elif arg_type == "java/lang/Enum":
+            # If we were using the read method instead of the write method, then we could get the class for this enum...
+            return [Operation(instruction.pos, "write", type="enum", field=arg)]
+        elif arg_type == classes["nbtcompound"]:
+            return [Operation(instruction.pos, "write", type="nbtcompound", field=arg)]
+        elif arg_type == classes["itemstack"]:
+            return [Operation(instruction.pos, "write", type="itemstack", field=arg)]
+        elif arg_type == classes["chatcomponent"]:
+            return [Operation(instruction.pos, "write", type="chatcomponent", field=arg)]
+        elif arg_type == classes["identifier"]:
+            return [Operation(instruction.pos, "write", type="identifier", field=arg)]
+        elif "position" not in classes or arg_type == classes["position"]:
+            if "position" not in classes:
+                classes["position"] = arg_type
+                if verbose:
+                    print("Assuming", arg_type, "is the position class")
+            return [Operation(instruction.pos, "write", type="position", field=arg)]
+
+        # Unknown type in packetbuffer; try inlining it as well
+        # (on the assumption that it's something made of a few calls,
+        # and not e.g. writeVarInt)
+        if verbose:
+            print("Inlining PacketBuffer.%s(%s)" % (name, arg_type))
+        return _PIT._sub_operations(classloader, classes, instruction, verbose,
+                                    cls, name, desc, [instance, arg])
+
+    @staticmethod
+    def _handle_2_arg_buffer_call(classloader, classes, instruction, verbose,
+                                  cls, name, desc, instance, args):
+        if desc.args[0].name == "java/lang/String" and desc.args[1].name == "int":
+            max_length = args[1] # not using this at this time
+            return [Operation(instruction.pos, "write", type="string", field=args[0])]
+        elif desc.args[0].name == "com/mojang/serialization/Codec":
+            codec = args[0]
+            value = args[1]
+            # This isn't the exact syntax used by DataFixerUpper,
+            # but it's close enough for our purposes
+            field = "%s.encode(%s)" % (codec, value)
+            return [Operation(instruction.pos, "write", type="nbtcompound", field=field)]
+        elif desc.args[0].name == "java/util/Collection" and \
+                desc.args[1].name == "java/util/function/BiConsumer":
+            # Loop that calls the consumer with the packetbuffer
+            # and value for each value in collection
+            # TODO: Disambiguate names it and itv if there are multiple loops
+            operations = []
+            field = args[0]
+            assert isinstance(field, StackOperand)
+            operations.append(Operation(instruction.pos, "write", type="varint",
+                                        field=field.value + ".size()"))
+            operations.append(Operation(instruction.pos, "store",
+                                        type="Iterator", var="it",
+                                        value=field.value + ".iterator()"))
+            operations.append(Operation(instruction.pos, "loop",
+                                        condition="it.hasNext()"))
+            info = args[1]
+            assert isinstance(info, InvokeDynamicInfo)
+            operations.append(Operation(instruction.pos, "store",
+                                        type=info.method_desc.args[-1].name.replace("/", "."),
+                                        var="itv", value="it.next()"))
+            operations += _PIT._lambda_operations(
+                classloader, classes, instruction, verbose,
+                info, [instance, "itv"]
+            )
+            # Jank: the part of the program that converts loop+endloop
+            # to a nested setup sorts the operations.
+            # Thus, if instruction.pos is used, _sub_operations
+            # adds epsilon to each sub-instruction, making them
+            # come after the endloop.
+            # Assume that 1 - SUB_INS_EPSILON (e.g. .99) will put
+            # the endloop past everything.
+            operations.append(Operation(instruction.pos + 1 - SUB_INS_EPSILON, "endloop"))
+            return operations
+        elif desc.args[0].name == "java/util/Optional" and \
+                desc.args[1].name == "java/util/function/BiConsumer":
+            # Write a boolean indicating whether the optional is present.
+            # Call the consumer with the packetbuffer and value if the optional is present.
+            operations = []
+            field = args[0]
+            assert isinstance(field, StackOperand)
+            operations.append(Operation(instruction.pos, "write", type="boolean",
+                                        field=field.value + ".isPresent()"))
+            operations.append(Operation(instruction.pos, "if",
+                                        condition=field.value + ".isPresent()"))
+            info = args[1]
+            assert isinstance(info, InvokeDynamicInfo)
+            operations += _PIT._lambda_operations(
+                classloader, classes, instruction, verbose,
+                info, [instance, field.value + ".get()"]
+            )
+            # Jank: the part of the program that converts loop+endloop
+            # to a nested setup sorts the operations.
+            # Thus, if instruction.pos is used, _sub_operations
+            # adds epsilon to each sub-instruction, making them
+            # come after the endloop.
+            # Assume that 1 - SUB_INS_EPSILON (e.g. .99) will put
+            # the endloop past everything.
+            operations.append(Operation(instruction.pos + 1 - SUB_INS_EPSILON, "endif"))
+            return operations
+        else:
+            raise Exception("Unexpected descriptor " + desc.descriptor)
+
+    @staticmethod
+    def _handle_3_arg_buffer_call(classloader, classes, instruction, verbose,
+                                  cls, name, desc, instance, args):
+        if desc.args[0].name == "java/util/Map" and \
+                desc.args[1].name == "java/util/function/BiConsumer" and \
+                desc.args[1].name == "java/util/function/BiConsumer":
+            # Loop that calls the consumers with the packetbuffer
+            # and key, and then packetbuffer and value, for each
+            # (key, value) pair in the map.
+            # TODO: Disambiguate names it and itv if there are multiple loops
+            operations = []
+            field = args[0]
+            assert isinstance(field, StackOperand)
+            operations.append(Operation(instruction.pos, "write", type="varint",
+                                        field=field.value + ".size()"))
+            operations.append(Operation(instruction.pos, "store",
+                                        type="Iterator", var="it",
+                                        value=field.value + ".iterator()"))
+            operations.append(Operation(instruction.pos, "loop",
+                                        condition="it.hasNext()"))
+            key_info = args[1]
+            val_info = args[2]
+            assert isinstance(key_info, InvokeDynamicInfo)
+            assert isinstance(val_info, InvokeDynamicInfo)
+            # TODO: these are violated
+            key_type = key_info.method_desc.args[-1].name.replace("/", ".")
+            val_type = val_info.method_desc.args[-1].name.replace("/", ".")
+            operations.append(Operation(instruction.pos, "store",
+                                        type="Map.Entry<" + key_type + ", " + val_type + ">",
+                                        var="itv", value="it.next()"))
+            operations += _PIT._lambda_operations(
+                classloader, classes, instruction, verbose,
+                key_info, [instance, "itv.getKey()"]
+            )
+            # TODO: Does the SUB_INS_EPSILON work correctly here?
+            # I think this will lead to [1.01, 1.02, 1.03, 1.01, 1.02, 1.03]
+            # which would get sorted wrongly, but I'm not sure
+            operations += _PIT._lambda_operations(
+                classloader, classes, instruction, verbose,
+                val_info, [instance, "itv.getValue()"]
+            )
+            # Same jank as with the one in _handle_2_arg_buffer_call
+            operations.append(Operation(instruction.pos + 1 - SUB_INS_EPSILON, "endloop"))
+            return operations
+        else:
+            raise Exception("Unexpected descriptor " + desc.descriptor)
+
+    @staticmethod
+    def _handle_foreach(classloader, classes, instruction, verbose,
+                        cls, name, desc, instance, consumer):
+        assert isinstance(instance, StackOperand)
+        assert isinstance(consumer, InvokeDynamicInfo)
+        assert "Consumer" in desc.args[0].name
+        operations = []
+        operations.append(Operation(instruction.pos, "store",
+                                    type="Iterator", var="it",
+                                    value=instance.value + ".iterator()"))
+        operations.append(Operation(instruction.pos, "loop",
+                                    condition="it.hasNext()"))
+        operations.append(Operation(instruction.pos, "store",
+                                    type=consumer.method_desc.args[-1].name.replace("/", "."),
+                                    var="itv", value="it.next()"))
+        operations += _PIT._lambda_operations(
+            classloader, classes, instruction, verbose, consumer, ["itv"]
+        )
+        # See comment in _handle_1_arg_buffer_call
+        operations.append(Operation(instruction.pos + 1 - SUB_INS_EPSILON, "endloop"))
+        return operations
+
+    @staticmethod
+    def join(arguments, separator=", "):
+        """Converts a list of object into a comma separated list"""
+        return separator.join(str(arg) for arg in arguments)
 
     @staticmethod
     def find_next(operations, position, operation_search):
@@ -629,29 +780,83 @@ class PacketInstructionsTopping(Topping):
         return sorted(operations, key=lambda op: op.position)
 
     @staticmethod
-    def sub_operations(classloader, cf, classes, instruction, verbose,
-                       operand, arg_names=[""]):
-        """Gets the instructions of a different class"""
-        invoked_class = operand.c + ".class"
-        name = operand.name
-        descriptor = operand.descriptor
-        args = method_descriptor(descriptor).args_descriptor
-        cache_key = "%s/%s/%s/%s" % (invoked_class, name,
-                                     descriptor, _PIT.join(arg_names, ","))
+    def _sub_operations(classloader, classes, instruction, verbose, invoked_class,
+                        name, desc, args):
+        """
+        Gets the instructions for a call to a different function.
+        Usually that function is in a different class.
+
+        Note that for instance methods, `this` is included in args.
+        """
+        cache_key = "%s/%s/%s/%s" % (invoked_class, name, desc, _PIT.join(args, ","))
 
         if cache_key in _PIT.CACHE:
             cache = _PIT.CACHE[cache_key]
             operations = [op.clone() for op in cache]
         else:
-            operations = _PIT.operations(classloader, invoked_class, classes, verbose,
-                                         args, name, arg_names)
+            cf = classloader[invoked_class]
+            method = cf.methods.find_one(name=name, args=desc.args_descriptor)
+            assert method != None
 
+            if method.access_flags.acc_abstract:
+                assert not method.access_flags.acc_static
+                call_type = "interface" if cf.access_flags.acc_interface else "abstract"
+                operations = [Operation(0, "interfacecall", type=call_type,
+                                        target=invoked_class, name=name,
+                                        method=name + desc.descriptor, field=args[0],
+                                        args=_PIT.join(args[1:]))]
+            else:
+                operations = _PIT.operations(classloader, cf, classes, verbose,
+                                             method, args)
+
+        # Sort operations by position, and try to ensure all of them fit between
+        # two normal instructions.  Note that since operations are renumbered
+        # on each use of _sub_operations, this is safe (recursive calls to
+        # _sub_operations will produce [1.01, 1.02, 1.03, 1.04], not
+        # [1.01, 1.0101, 1.0102, 1.02] or [1.01, 1.02, 1.03, 1.02]).
         position = 0
         for operation in _PIT.ordered_operations(operations):
-            position += 0.01
+            position += SUB_INS_EPSILON
+            # However, it will break if the position gets too large, as then
+            # something like [1.01, 1.02, ..., 1.99, 2.00, 2.01, 2] could occur.
+            # If this happens, just shrink SUB_INS_EPSILON.
+            assert(position < 1)
             operation.position = instruction.pos + (position)
 
         _PIT.CACHE[cache_key] = operations
+
+        return operations
+
+    @staticmethod
+    def _lambda_operations(classloader, classes, instruction, verbose, info, args):
+        assert isinstance(info, InvokeDynamicInfo)
+        assert len(args) == len(info.instantiated_desc.args)
+
+        effective_args = info.stored_args + args
+        if info.ref_kind == REF_invokeStatic:
+            assert len(effective_args) == len(info.method_desc.args)
+        else:
+            # The `this` parameter must be supplied.  Usually this will be in
+            # effective_args, but it's also valid to use Class::function
+            # and then provide an instance of class along with the parameters
+            # to function.
+            assert len(effective_args) == len(info.method_desc.args) + 1
+            # I don't think Java allows pre-supplying other arguments in this
+            # case (as that'd require reordering them to make `this` first).
+            assert len(info.stored_args) == 0 or len(info.stored_args) == 1
+
+        # Now just call the (generated) method.
+        # Note that info is included because this is
+        cf, method = info.create_method()
+        operations = _PIT.operations(classloader, cf, classes, verbose,
+                                     method, effective_args)
+
+        position = 0
+        # See note in _sub_operations
+        for operation in _PIT.ordered_operations(operations):
+            position += SUB_INS_EPSILON
+            assert(position < 1)
+            operation.position = instruction.pos + (position)
 
         return operations
 

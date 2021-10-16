@@ -1,76 +1,409 @@
 from abc import ABC, abstractmethod
 
+from jawa.assemble import assemble
+from jawa.cf import ClassFile
+from jawa.methods import Method
 from jawa.constants import *
 from jawa.util.descriptor import method_descriptor
+from jawa.util.bytecode import Operand
 
 import six.moves
+
+# See https://docs.oracle.com/javase/specs/jvms/se8/html/jvms-4.html#jvms-4.4.8
+REF_getField = 1
+REF_getStatic = 2
+REF_putField = 3
+REF_putStatic = 4
+REF_invokeVirtual = 5
+REF_invokeStatic = 6
+REF_invokeSpecial = 7
+REF_newInvokeSpecial = 8
+REF_invokeInterface = 9
+
+FIELD_REFS = (REF_getField, REF_getStatic, REF_putField, REF_putStatic)
+
+class InvokeDynamicInfo(ABC):
+    @staticmethod
+    def create(ins, cf):
+        if isinstance(ins.operands[0], Operand):
+            # Hack due to packetinstructions not expanding constants
+            const = cf.constants[ins.operands[0].value]
+        else:
+            const = ins.operands[0]
+
+        bootstrap = cf.bootstrap_methods[const.method_attr_index]
+        method = cf.constants.get(bootstrap.method_ref)
+        if method.reference.class_.name == "java/lang/invoke/LambdaMetafactory":
+            return LambdaInvokeDynamicInfo(ins, cf, const)
+        elif method.reference.class_.name == "java/lang/invoke/StringConcatFactory":
+            return StringConcatInvokeDynamicInfo(ins, cf, const)
+        else:
+            raise Exception("Unknown invokedynamic class: " + method.reference.class_.name.value)
+
+    def __init__(self, ins, cf, const):
+        self._ins = ins
+        self._cf = cf
+        self.stored_args = None
+
+    @abstractmethod
+    def __str__():
+        pass
+
+    def apply_to_stack(self, stack):
+        """
+        Used to simulate an invokedynamic instruction.  Pops relevant args, and
+        puts this object (used to simulate the function we return) onto the stack.
+        """
+        assert self.stored_args == None # Should only be called once
+
+        num_arguments = len(self.dynamic_desc.args)
+        if num_arguments > 0:
+            self.stored_args = stack[-len(self.dynamic_desc.args):]
+        else:
+            self.stored_args = []
+        for _ in six.moves.range(num_arguments):
+            stack.pop()
+
+        stack.append(self)
+
+    @abstractmethod
+    def create_method(self):
+        pass
+
+class LambdaInvokeDynamicInfo(InvokeDynamicInfo):
+    """
+    Stores information related to an invokedynamic instruction.
+    """
+
+    def __init__(self, ins, cf, const):
+        super().__init__(ins, cf, const)
+        self.generated_cf = None
+        self.generated_method = None
+
+        bootstrap = cf.bootstrap_methods[const.method_attr_index]
+        method = cf.constants.get(bootstrap.method_ref)
+        # Make sure this is a reference to LambdaMetafactory.metafactory
+        assert method.reference_kind == REF_invokeStatic
+        assert method.reference.class_.name == "java/lang/invoke/LambdaMetafactory"
+        assert method.reference.name_and_type.name == "metafactory"
+        assert len(bootstrap.bootstrap_args) == 3 # Num arguments
+        # It could also be a reference to LambdaMetafactory.altMetafactory.
+        # This is used for intersection types, which I don't think I've ever seen
+        # used in the wild, and maybe for some other things.  Here's an example:
+        """
+        class Example {
+            interface A { default int foo() { return 1; } }
+            interface B { int bar(); }
+            public Object test() {
+                return (A & B)() -> 1;
+            }
+        }
+        """
+        # See https://docs.oracle.com/javase/specs/jls/se8/html/jls-4.html#jls-4.9
+        # and https://docs.oracle.com/javase/specs/jls/se8/html/jls-9.html#jls-9.8-200-D
+        # for details.  Minecraft doesn't use this, so let's just pretend it doesn't exist.
+
+        # Now check the arguments.  Note that LambdaMetafactory has some
+        # arguments automatically filled in.  The bootstrap arguments are:
+        # args[0] is samMethodType, signature of the implemented method
+        # args[1] is implMethod, the method handle that is used
+        # args[2] is instantiatedMethodType, narrower signature of the implemented method
+        # We only really care about the method handle, and just assume that the
+        # method handle satisfies instantiatedMethodType, and that that also
+        # satisfies samMethodType.  instantiatedMethodType could maybe be used
+        # to get the type of object created by the returned function, but I'm not
+        # sure if there's a reason to do that over just looking at the handle.
+        methodhandle = cf.constants.get(bootstrap.bootstrap_args[1])
+        self.ref_kind = methodhandle.reference_kind
+
+        # instantiatedMethodType does have a use when executing the created
+        # object, so store it for later.
+        instantiated = cf.constants.get(bootstrap.bootstrap_args[2])
+        self.instantiated_desc = method_descriptor(instantiated.descriptor.value)
+
+        assert self.ref_kind >= REF_getField and self.ref_kind <= REF_invokeInterface
+        # Javac does not appear to use REF_getField, REF_getStatic,
+        # REF_putField, or REF_putStatic, so don't bother handling fields here.
+        assert self.ref_kind not in FIELD_REFS
+
+        self.method_class = methodhandle.reference.class_.name.value
+        self.method_name = methodhandle.reference.name_and_type.name.value
+        self.method_desc = method_descriptor(methodhandle.reference.name_and_type.descriptor.value)
+
+        if self.ref_kind == REF_newInvokeSpecial:
+            # https://docs.oracle.com/javase/specs/jvms/se8/html/jvms-4.html#jvms-4.4.8-200-C.2
+            assert self.method_name == "<init>"
+        else:
+            # https://docs.oracle.com/javase/specs/jvms/se8/html/jvms-4.html#jvms-4.4.8-200-C.1
+            assert self.method_name not in ("<init>", "<clinit>")
+
+        # Although invokeinterface won't cause problems here, other code likely
+        # will break with it, so bail out early for now (if it's eventually used,
+        # it can be fixed later)
+        assert self.ref_kind != REF_invokeInterface
+
+        # As for stack changes, consider the following:
+        """
+        public Supplier<String> foo() {
+          return this::toString;
+        }
+        public Function<Object, String> bar() {
+          return Object::toString;
+        }
+        public static Supplier<String> baz(String a, String b, String c) {
+          return () -> a + b + c;
+        }
+        public Supplier<Object> quux() {
+          return Object::new;
+        }
+        """
+        # Which disassembles (tidied to remove java.lang and java.util) to:
+        """
+        Constant pool:
+          #2 = InvokeDynamic      #0:#38         // #0:get:(LClassName;)LSupplier;
+          #3 = InvokeDynamic      #1:#41         // #1:apply:()LFunction;
+          #4 = InvokeDynamic      #2:#43         // #2:get:(LString;LString;LString;)LSupplier;
+          #5 = InvokeDynamic      #3:#45         // #3:get:()LSupplier;
+        public Supplier<String> foo();
+          Code:
+            0: aload_0
+            1: invokedynamic #2,  0
+            6: areturn
+        public Function<Object, String> bar();
+          Code:
+            0: invokedynamic #3,  0
+            5: areturn
+        public static Supplier<String> baz(String, String, String);
+          Code:
+            0: aload_0
+            1: aload_1
+            2: aload_2
+            3: invokedynamic #4,  0
+            8: areturn
+        public Supplier<java.lang.Object> quux();
+          Code:
+            0: invokedynamic #5,  0
+            5: areturn
+        private static synthetic String lambda$baz$0(String, String, String);
+          -snip-
+        BootstrapMethods:
+          0: #34 invokestatic -snip- LambdaMetafactory.metafactory -snip-
+            Method arguments:
+              #35 ()LObject;
+              #36 invokevirtual Object.toString:()LString;
+              #37 ()LString;
+          1: #34 invokestatic -snip- LambdaMetafactory.metafactory -snip-
+            Method arguments:
+              #39 (LObject;)LObject;
+              #36 invokevirtual Object.toString:()LString;
+              #40 (LObject;)LString;
+          2: #34 invokestatic -snip- LambdaMetafactory.metafactory -snip-
+            Method arguments:
+              #35 ()LObject;
+              #42 invokestatic ClassName.lambda$baz$0:(LString;LString;LString;)LString;
+              #37 ()LString;
+          3: #34 invokestatic -snip- LambdaMetafactory.metafactory -snip-
+            Method arguments:
+              #35 ()LObject;
+              #44 newinvokespecial Object."<init>":()V
+              #35 ()LObject;
+        """
+        # Note that both foo and bar have invokevirtual in the method handle,
+        # but `this` is added to the stack in foo().
+        # Similarly, baz pushes 3 arguments to the stack.  Unfortunately the JVM
+        # spec doesn't make it super clear how to decide how many items to
+        # pop from the stack for invokedynamic.  My guess, looking at the
+        # constant pool, is that it's the name_and_type member of InvokeDynamic,
+        # specifically the descriptor, that determines stack changes.
+        # https://docs.oracle.com/javase/specs/jvms/se8/html/jvms-4.html#jvms-4.10.1.9.invokedynamic
+        # kinda confirms this without explicitly stating it.
+        self.dynamic_name = const.name_and_type.name.value
+        self.dynamic_desc = method_descriptor(const.name_and_type.descriptor.value)
+
+        assert self.dynamic_desc.returns.name != "void"
+        self.implemented_iface = self.dynamic_desc.returns.name
+
+        # created_type is the type returned by the function we return.
+        if self.ref_kind == REF_newInvokeSpecial:
+            self.created_type = self.method_class
+        else:
+            self.created_type = self.method_desc.returns.name
+
+    def __str__(self):
+        # TODO: be closer to Java syntax (using the stored args)
+        return "%s::%s" % (self.method_class, self.method_name)
+
+    def create_method(self):
+        """
+        Creates a Method that corresponds to the generated function call.
+        It will be part of a class that implements the right interface, and will
+        have the appropriate name and signature.
+        """
+        assert self.stored_args != None
+        if self.generated_method != None:
+            return (self.generated_cf, self.generated_method)
+
+        class_name = self._cf.this.name.value + "_lambda_" + str(self._ins.pos)
+        self.generated_cf = ClassFile.create(class_name)
+        # Jawa doesn't seem to expose this cleanly.  Technically we don't need
+        # to implement the interface because the caller doesn't actually care,
+        # but it's better to implement it anyways for the future.
+        # (Due to the hacks below, the interface isn't even implemented properly
+        # since the method we create has additional parameters and is static.)
+        iface_const = self.generated_cf.constants.create_class(self.implemented_iface)
+        self.generated_cf._interfaces.append(iface_const.index)
+
+        # HACK: This officially should use instantiated_desc.descriptor,
+        # but instead use a combination of the stored arguments and the
+        # instantiated descriptor to make packetinstructions work better
+        # (otherwise we'd need to generate and load fields in a way that
+        # packetinstructions understands)
+        descriptor = "(" + self.dynamic_desc.args_descriptor + \
+                        self.instantiated_desc.args_descriptor + ")" + \
+                        self.instantiated_desc.returns_descriptor
+        method = self.generated_cf.methods.create(self.dynamic_name,
+                                                  descriptor, code=True)
+        self.generated_method = method
+        # Similar hack: make the method static, so that packetinstructions
+        # doesn't look for the corresponding instance.
+        method.access_flags.acc_static = True
+        # Third hack: the extra arguments are in the local variables/arguments
+        # list, not on the stack.  So we need to move them to the stack.
+        # (In a real implementation, these would probably be getfield instructions)
+        # Also, this uses aload for everything, instead of using the appropriate
+        # instruction for each type.
+        instructions = []
+        for i in range(len(method.args)):
+            instructions.append(("aload", i))
+
+        cls_ref = self.generated_cf.constants.create_class(self.method_class)
+        if self.ref_kind in FIELD_REFS:
+            # This case is not currently hit, but provided for future use
+            # (Likely method_name and method_descriptor would no longer be used though)
+            ref = self.generated_cf.constants.create_field_ref(
+                    self.method_class, self.method_name, self.method_desc.descriptor)
+        elif self.ref_kind == REF_invokeInterface:
+            ref = self.generated_cf.constants.create_interface_method_ref(
+                    self.method_class, self.method_name, self.method_desc.descriptor)
+        else:
+            ref = self.generated_cf.constants.create_method_ref(
+                    self.method_class, self.method_name, self.method_desc.descriptor)
+
+        # See https://docs.oracle.com/javase/specs/jvms/se8/html/jvms-5.html#jvms-5.4.3.5
+        if self.ref_kind == REF_getField:
+            instructions.append(("getfield", ref))
+        elif self.ref_kind == REF_getStatic:
+            instructions.append(("getstatic", ref))
+        elif self.ref_kind == REF_putField:
+            instructions.append(("putfield", ref))
+        elif self.ref_kind == REF_putStatic:
+            instructions.append(("putstatic", ref))
+        elif self.ref_kind == REF_invokeVirtual:
+            instructions.append(("invokevirtual", ref))
+        elif self.ref_kind == REF_invokeStatic:
+            instructions.append(("invokestatic", ref))
+        elif self.ref_kind == REF_invokeSpecial:
+            instructions.append(("invokespecial", ref))
+        elif self.ref_kind == REF_newInvokeSpecial:
+            instructions.append(("new", cls_ref))
+            instructions.append(("dup",))
+            instructions.append(("invokespecial", ref))
+        elif self.ref_kind == REF_invokeInterface:
+            instructions.append(("invokeinterface", ref))
+
+        method.code.assemble(assemble(instructions))
+
+        return (self.generated_cf, self.generated_method)
+
+class StringConcatInvokeDynamicInfo(InvokeDynamicInfo):
+    """
+    Java 9+ uses invokedynamic for string concatenation:
+    https://www.guardsquare.com/blog/string-concatenation-java-9-untangling-invokedynamic
+    """
+    # An example:
+    """
+    public static String foo(int num, int num2) {
+      return "num=" + num + " and num2=" + num2;
+    }
+    """
+    # Becomes:
+    """
+    Constant pool:
+      #7 = InvokeDynamic      #0:#8          // #0:makeConcatWithConstants:(II)Ljava/lang/String;
+    public static java.lang.String foo(int, int);
+      descriptor: (II)Ljava/lang/String;
+      flags: (0x0009) ACC_PUBLIC, ACC_STATIC
+      Code:
+        stack=2, locals=2, args_size=2
+           0: iload_0
+           1: iload_1
+           2: invokedynamic #7,  0              // InvokeDynamic #0:makeConcatWithConstants:(II)Ljava/lang/String;
+           7: areturn
+        LineNumberTable:
+          line 3: 0
+    BootstrapMethods:
+      0: #19 REF_invokeStatic -snip- StringConcatFactory.makeConcatWithConstants -snip-
+        Method arguments:
+          #25 num=\u0001 and num2=\u0001
+    """
+    # Note that the format string can have \u0002 in it as well to indicate a constant.
+    # I haven't seen any cases of \u0002 yet.
+
+    def __init__(self, ins, cf, const):
+        super().__init__(ins, cf, const)
+
+        bootstrap = cf.bootstrap_methods[const.method_attr_index]
+        method = cf.constants.get(bootstrap.method_ref)
+        # Make sure this is a reference to StringConcatFactory.makeConcatWithConstants
+        assert method.reference_kind == REF_invokeStatic
+        assert method.reference.class_.name == "java/lang/invoke/StringConcatFactory"
+        assert method.reference.name_and_type.name == "makeConcatWithConstants"
+        assert len(bootstrap.bootstrap_args) == 1 # Num arguments - may change with constants
+
+        # Now check the arguments.  Note that StringConcatFactory has some
+        # arguments automatically filled in.  The bootstrap arguments are:
+        # args[0] is recipe, format string
+        # Further arguments presumably go into the constants varargs array, but I haven't seen this
+        # (and I'm not sure how you get a constant that can't be converted to a string at compile time)
+        self.recipe = cf.constants.get(bootstrap.bootstrap_args[0]).string.value
+        assert '\u0002' not in self.recipe
+
+        self.dynamic_name = const.name_and_type.name.value
+        self.dynamic_desc = method_descriptor(const.name_and_type.descriptor.value)
+
+        assert self.dynamic_desc.returns.name == "java/lang/String"
+
+    def __str__(self):
+        recipe = self.recipe.replace("\u0001", "\\u0001").replace("\u0002", "\\u0002")
+        if (self.stored_args == None):
+            return "format_concat(\"%s\", ...)" % (recipe,)
+        else:
+            return "format_concat(\"%s\", %s)" % (recipe, ", ".join(str(a) for a in self.stored_args))
+
+    def create_method(self):
+        raise NotImplementedError()
 
 def class_from_invokedynamic(ins, cf):
     """
     Gets the class type for an invokedynamic instruction that
     calls a constructor.
     """
-    const = ins.operands[0]
-    bootstrap = cf.bootstrap_methods[const.method_attr_index]
-    method = cf.constants.get(bootstrap.method_ref)
-    # Make sure this is a reference to LambdaMetafactory
-    assert method.reference_kind == 6 # REF_invokeStatic
-    assert method.reference.class_.name == "java/lang/invoke/LambdaMetafactory"
-    assert method.reference.name_and_type.name == "metafactory"
-    assert len(bootstrap.bootstrap_args) == 3 # Num arguments
-    # Now check the arguments.  Note that LambdaMetafactory has some
-    # arguments automatically filled in.
-    methodhandle = cf.constants.get(bootstrap.bootstrap_args[1])
-    assert methodhandle.reference_kind == 8 # REF_newInvokeSpecial
-    assert methodhandle.reference.name_and_type.name == "<init>"
-    # OK, now that we've done all those checks, just get the type
-    # from the constructor.
-    return methodhandle.reference.class_.name.value
-
-def stringify_invokedynamic(obj, ins, cf):
-    """
-    Converts an invokedynamic instruction into a string.
-
-    This is a rather limited implementation for now, only handling obj::method.
-    """
-    const = cf.constants[ins.operands[0].value] # Hack due to packetinstructions not expanding constants
-    bootstrap = cf.bootstrap_methods[const.method_attr_index]
-    method = cf.constants.get(bootstrap.method_ref)
-    # Make sure this is a reference to LambdaMetafactory
-    assert method.reference_kind == 6 # REF_invokeStatic
-    assert method.reference.class_.name == "java/lang/invoke/LambdaMetafactory"
-    assert method.reference.name_and_type.name == "metafactory"
-    assert len(bootstrap.bootstrap_args) == 3 # Num arguments
-    # Actual implementation.
-    methodhandle = cf.constants.get(bootstrap.bootstrap_args[1])
-    if methodhandle.reference_kind == 7: # REF_invokeSpecial
-        return "%s::%s" % (obj, methodhandle.reference.name_and_type.name.value)
-    else:
-        raise Exception("Unhandled reference_kind %d" % methodhandle.reference_kind)
+    info = InvokeDynamicInfo.create(ins, cf)
+    assert info.created_type != "void"
+    return info.created_type
 
 def try_eval_lambda(ins, args, cf):
     """
     Attempts to call a lambda function that returns a constant value.
     May throw; this code is very hacky.
     """
-    const = ins.operands[0]
-    bootstrap = cf.bootstrap_methods[const.method_attr_index]
-    method = cf.constants.get(bootstrap.method_ref)
-    # Make sure this is a reference to LambdaMetafactory
-    assert method.reference_kind == 6 # REF_invokeStatic
-    assert method.reference.class_.name == "java/lang/invoke/LambdaMetafactory"
-    assert method.reference.name_and_type.name == "metafactory"
-    assert len(bootstrap.bootstrap_args) == 3 # Num arguments
-    methodhandle = cf.constants.get(bootstrap.bootstrap_args[1])
-    assert methodhandle.reference_kind == 6 # REF_invokeStatic
+    info = InvokeDynamicInfo.create(ins, cf)
     # We only want to deal with lambdas in the same class
-    assert methodhandle.reference.class_.name == cf.this.name
+    assert info.ref_kind == REF_invokeStatic
+    assert info.method_class == cf.this.name
 
-    name2 = methodhandle.reference.name_and_type.name.value
-    desc2 = method_descriptor(methodhandle.reference.name_and_type.descriptor.value)
-
-    lambda_method = cf.methods.find_one(name=name2, args=desc2.args_descriptor, returns=desc2.returns_descriptor)
-    assert lambda_method
+    lambda_method = cf.methods.find_one(name=info.method_name, args=info.method_desc.args_descriptor, returns=info.method_desc.returns_descriptor)
+    assert lambda_method != None
 
     class Callback(WalkerCallback):
         def on_new(self, ins, const):
@@ -85,6 +418,14 @@ def try_eval_lambda(ins, args, cf):
     # Set verbose to false because we don't want lots of output if this errors
     # (since it is expected to for more complex methods)
     return walk_method(cf, lambda_method, Callback(), False, args)
+
+def string_from_invokedymanic(ins, cf):
+    """
+    Gets the recipe string for a string concatenation implemented via invokedynamc.
+    """
+    info = InvokeDynamicInfo.create(ins, cf)
+    assert isinstance(info, StringConcatInvokeDynamicInfo)
+    return info.recipe
 
 class WalkerCallback(ABC):
     """
